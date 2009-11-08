@@ -8,9 +8,7 @@ use MyTest::PPG ':all';
 use Test::Most 'no_plan'; #tests => 1;
 use Pod::Parser::Groffmom;
 
-my $parser = Pod::Parser::Groffmom->new;
-
-open my $fh, '<', \<<'END' or die $!;
+my $pod = <<'END';
 =head1 NAME
 
 E<ntilde> eq E<241>
@@ -35,8 +33,8 @@ This is a line which breaks.  I recommend you look at Salvador FandiE<ntilde>o's
 
 END
 
-$parser->parse_from_filehandle($fh);
-is head( $parser->mom, 1 ), q{.TITLE "\\N'241' eq \\N'241'"},
+my $mom = get_mom($pod);
+is head( $mom, 1 ), q{.TITLE "\\N'241' eq \\N'241'"},
   'E<> sequences should be parsed correctly';
 
 my $expected_body = <<'END';
@@ -51,13 +49,13 @@ the Net::Ping module (\f[C]Net::Ping\f[P])
 
 support section (\f[C]PPI/SUPPORT\f[P])
 
- (\f[C]http://www\N'46'example\N'46'com\f[P])
+ (\f[C]http://www.example.com\f[P])
 
 \[dq]For Loops\[dq] (\f[C]perlsyn\f[P])
 
 For Loops (\f[C]perlsyn\f[P])
 
-This is a line which breaks\N'46'  I recommend you look at Salvador Fandi\N'241'o's  \c
+This is a line which breaks.  I recommend you look at Salvador Fandi\N'241'o's  \c
 .HYPHENATE OFF
 Language::Prolog::Yaswi\c
 .HYPHENATE
@@ -65,5 +63,5 @@ Language::Prolog::Yaswi\c
 
 END
 
-eq_or_diff body($parser->mom), $expected_body,
+eq_or_diff body($mom), $expected_body,
     '... and L<> seqeunces should be parsed correctly';

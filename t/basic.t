@@ -4,6 +4,7 @@ use strict;
 use warnings;
 
 use Test::Most tests => 4;
+
 use Pod::Parser::Groffmom;
 
 ok my $parser = Pod::Parser::Groffmom->new,
@@ -54,7 +55,7 @@ sub get_mom {
 
 .SUBHEAD "This is another subheader"
 
-We want POD text to \f[I]automatically\f[P] be converted to the correct format\N'46'
+We want POD text to \f[I]automatically\f[P] be converted to the correct format.
 
 .L_MARGIN 1.25i
 .LIST BULLET
@@ -72,7 +73,7 @@ Second item
 .PT_SIZE 10
 .LEFT
 .L_MARGIN 1.25i
- If at first you don't succeed \N'46'\N'46'\N'46'
+ If at first you don't succeed ...
  :wq
 .QUAD
 .L_MARGIN 1i

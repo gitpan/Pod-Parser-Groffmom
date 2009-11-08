@@ -18,19 +18,36 @@ my @MOM_BOOLEANS = qw(cover newpage toc);
 my %IS_MOM       = map { uc($_) => 1 } ( @MOM_METHODS, @MOM_BOOLEANS );
 
 foreach my $method ( __PACKAGE__->mom_methods, __PACKAGE__->mom_booleans ) {
-    has $method                       => ( is => 'rw', isa => 'Bool' );
-    has "mom_$method"                 => ( is => 'rw', isa => 'Str' );
+
+    # did we find this thing in the POD?
+    has $method => ( is => 'rw', isa => 'Bool' );
+
+    # let's set the actual value to what we found
+    has "mom_$method" => ( is => 'rw', isa => 'Str' );
+
+    # it was set in the contructor
     has "$method\_set_in_constructor" => ( is => 'rw', isa => 'Bool' );
+
+    # Also store them in plain text in case people need 'em
+    has "original_$method" => ( is => 'rw', isa => 'Str' );
+}
+
+# This is an embarrasing, nasty hack.
+sub get_mom_and_ctr_methods {
+    my ( $class, $method ) = @_;
+    return ( "mom_$method", "$method\_set_in_constructor" );
 }
 
 sub BUILD {
     my $self = shift;
     foreach my $method ( __PACKAGE__->mom_methods, __PACKAGE__->mom_booleans )
     {
-        my $mom = "mom_$method";
-        my $ctr = "$method\_set_in_constructor";
-        if ( $self->$mom ) {
-            $self->$ctr(1);
+        my ( $mom, $set_in_contructor )
+          = $self->get_mom_and_ctr_methods($method);
+        if ( my $value = $self->$mom ) {
+            my $orig = "original_$method";
+            $self->$orig($value);
+            $self->$set_in_contructor(1);
         }
     }
 }
@@ -39,25 +56,31 @@ has head    => ( is => 'rw' );
 has subhead => ( is => 'rw' );
 has mom     => ( is => 'rw', isa => 'Str', default => '' );
 has toc => ( is => 'rw', => isa => 'Bool' );
-has highlight => ( is => 'rw' );
+has highlight    => ( is => 'rw' );
+has last_title   => ( is => 'rw', isa => 'Str' );
+has in_file_mode => ( is => 'ro', isa => 'Bool', default => 0, writer => 'set_in_file_mode' );
 
 # list helpers
 has in_list_mode => ( is => 'rw', isa => 'Int', default => 0 );
 has list_data    => ( is => 'rw', isa => 'Str', default => '' );
 has list_type => ( is => 'rw', isa => enum( [ '', qw/BULLET DIGIT/ ] ) );
 
-sub mom_methods  { @MOM_METHODS }
-sub mom_booleans { @MOM_BOOLEANS }
+has fh => ( is => 'rw' );
+has file_name => ( is => 'rw', isa => 'Str' );
+
+sub mom_methods  {@MOM_METHODS}
+sub mom_booleans {@MOM_BOOLEANS}
 
 sub is_mom {
-    my ( $class, $command, $paragraph ) = @_;
-    $DB::single = 1;
+    my ( $self, $command, $paragraph ) = @_;
     if ( $command =~ /^head[123]/ ) {
         return 1 if $paragraph eq 'NAME';    # special alias for 'TITLE'
         return $IS_MOM{$paragraph};
     }
     elsif ( $command eq 'for' ) {
-        return 1 if $paragraph =~ /^mom\s+\w+/;
+        if ( $paragraph =~ /^mom\s+(?:newpage|toc|cover)/i ) {
+            return 1;
+        }
     }
 }
 
@@ -67,11 +90,11 @@ Pod::Parser::Groffmom - Convert POD to a format groff_mom can handle.
 
 =head1 VERSION
 
-Version 0.030
+Version 0.040
 
 =cut
 
-our $VERSION = '0.030';
+our $VERSION = '0.040';
 $VERSION = eval $VERSION;
 
 sub _trim {
@@ -91,7 +114,13 @@ sub _escape {
     # We need to do this list dots appear at the beginning of a line an look
     # like mom macros.  This can happen if you have a some inline sequences
     # terminating a sentence (e.g. "See the module S<C<Foo::Module>>.").
-    $text =~ s/\./\\N'46'/g;
+    $text =~ s/^\./\\N'46'/;
+    $text =~ s/\n\./\n\\N'46'/g;
+
+    # cheap attempt to combat issue with some inline sequences ending a
+    # sentence and forcing a linebreak with the final period on a line by
+    # itself.
+    $text =~ s/([[:upper:]]<+[^>]*>+)\./$1\\N'46'/g;
 
     return $text;
 }
@@ -103,7 +132,7 @@ sub command {
     $self->$_(0) foreach $self->mom_methods;
     $paragraph = $self->_trim($paragraph);
 
-    my $is_mom = $self->is_mom($command, $paragraph);
+    my $is_mom = $self->is_mom( $command, $paragraph );
     $paragraph = lc $paragraph if $is_mom;
     if ($is_mom) {
         $self->parse_mom( $command, $paragraph, $line_num );
@@ -117,12 +146,12 @@ sub parse_mom {
     my ( $self, $command, $paragraph, $line_num ) = @_;
     $paragraph = 'title' if $paragraph eq 'name';
     foreach my $method ( $self->mom_methods ) {
-        my $mom_method = "mom_$method";
-        my $ctr        = "$method\_set_in_constructor";
+        my ( $mom, $set_in_contructor )
+          = $self->get_mom_and_ctr_methods($method);
         if ( $paragraph eq $method ) {
-            if ( my $item = $self->$mom_method ) {
+            if ( my $item = $self->$mom ) {
                 croak("Tried to reset $method ($item) at line $line_num")
-                    unless $self->$ctr;
+                  unless $self->$set_in_contructor;
             }
             $self->$method(1);
             return;
@@ -137,34 +166,62 @@ sub parse_mom {
     my %command_handler = (
         head1 => sub {
             my ( $self, $paragraph ) = @_;
+            $self->last_title($paragraph);
             $paragraph = $self->interpolate($paragraph);
             $self->add_to_mom(qq{.HEAD "$paragraph"\n\n});
         },
         head2 => sub {
             my ( $self, $paragraph ) = @_;
+            $self->last_title($paragraph);
             $paragraph = $self->interpolate($paragraph);
             $self->add_to_mom(qq{.SUBHEAD "$paragraph"\n\n});
         },
         head3 => sub {
             my ( $self, $paragraph ) = @_;
             $paragraph = $self->interpolate($paragraph);
+            $self->last_title($paragraph);
             $self->add_to_mom(qq{\\f[B]$paragraph\\f[P]\n\n});
+        },
+        for => sub {
+            my ( $self, $paragraph ) = @_;
+            if ( $paragraph =~ /^mom\s+tofile\s+(.*?)\s*$/i ) {
+                if ( my $file = $1 ) {
+                    if ( -f $file ) {
+                        unlink $file or croak("Could not unlink($file): $!");
+                    }
+                    open my $fh, '>>', $file
+                      or croak("Could not open ($file) for appending: $!");
+                    close $self->fh if $self->fh;
+                    $self->fh($fh);
+                    $self->file_name($file);
+                }
+                elsif ( not $self->file_name ) {
+                    croak("'=for mom tofile' found but filename not set");
+                }
+            }
         },
         begin => sub {
             my ( $self, $paragraph ) = @_;
             $paragraph = $self->_trim($paragraph);
-            my ( $target, $language ) =
-              $paragraph =~ /^(highlight)(?:\s+(.*))?$/;
-            if ( $target && !$language ) {
-                $language = 'Perl';
+            if ( $paragraph =~ /^(highlight)(?:\s+(.*))?$/i ) {
+                my ( $target, $language ) = ( $1, $2 );
+                if ( $target && !$language ) {
+                    $language = 'Perl';
+                }
+                $self->highlight( get_highlighter($language) );
             }
-            $self->highlight( get_highlighter($language) );
+            elsif ( $paragraph =~ /^mom\s+tofile\s*/i ) {
+                $self->set_in_file_mode(1);
+            }
         },
         end => sub {
             my ( $self, $paragraph ) = @_;
             $paragraph = $self->_trim($paragraph);
             if ( $paragraph eq 'highlight' ) {
                 $self->highlight('');
+            }
+            elsif ( $paragraph =~ /^mom\s+tofile\s*/i ) {
+                $self->set_in_file_mode(0);
             }
         },
         pod => sub { },    # noop
@@ -186,7 +243,7 @@ sub build_mom {
         $self->$handler($paragraph);
     }
     else {
-        carp("Unknown command ($command) at line $line_num");
+        carp("Unknown command (=$command $paragraph) at line $line_num");
     }
 }
 
@@ -206,10 +263,8 @@ sub build_list {
             $self->list_data( $self->list_data . ".LIST END\n" );
         }
         if ( !$self->in_list_mode ) {
-            my $list =
-                ".L_MARGIN 1.25i\n"
-              . $self->list_data
-              . "\n.L_MARGIN 1i\n";
+            my $list
+              = ".L_MARGIN 1.25i\n" . $self->list_data . "\n.L_MARGIN 1i\n";
             $self->add_to_mom($list);
             $self->list_data('');
         }
@@ -217,7 +272,7 @@ sub build_list {
     elsif ( 'item' eq $command ) {
         if ( not $self->in_list_mode ) {
             carp(
-"Found (=item $paragraph) outside of list at line $line_num.  Discarding"
+                "Found (=item $paragraph) outside of list at line $line_num.  Discarding"
             );
             return;
         }
@@ -246,12 +301,25 @@ sub add_to_list {
     my ( $self, $text ) = @_;
     return unless defined $text;
     $text = $self->interpolate($text);
-    $self->list_data( ( $self->list_data ) . $text );
+
+    # This horror of horrors is because we want simple lists to be single
+    # spaced, unless there are further details after the =item line, in which
+    # case an extra newline is needed for pleasant formatting.
+    my $break = '';
+    if ( $self->list_data =~ /\n.ITEM\n.*\n$/ && $text !~ /^.ITEM/ ) {
+        $break = "\n";
+    }
+    $self->list_data( ( $self->list_data ) . "$break$text" );
 }
 
 sub end_input {
     my $self = shift;
     my $mom  = '';
+
+    if ( $self->fh ) {
+        my $filename = $self->file_name;
+        close $self->fh or croak("Could not close ($filename): $!");
+    }
 
     foreach my $method ( $self->mom_methods ) {
         my $mom_method = "mom_$method";
@@ -285,8 +353,19 @@ END
     $self->mom( $self->mom . ".TOC\n" ) if $self->mom_toc;
 }
 
+sub add_to_file {
+    my ( $self, $data ) = @_;
+    croak("Not in file mode!") unless $self->in_file_mode;
+    my $fh = $self->fh or croak("No filehandle found");
+    print $fh $data;
+}
+
 sub verbatim {
     my ( $self, $verbatim, $paragraph, $line_num ) = @_;
+    if ( $self->in_file_mode ) {
+        $self->add_to_file($verbatim);
+        return;
+    }
     $verbatim =~ s/\s+$//s;
     if ( $self->highlight ) {
         $verbatim = $self->highlight->highlightText($verbatim);
@@ -310,18 +389,33 @@ END
 
 sub textblock {
     my ( $self, $textblock, $paragraph, $line_num ) = @_;
+
+    if ( $self->in_file_mode ) {
+        $self->add_to_file($textblock);
+        return;
+    }
+
+    my $original_textblock = $textblock;
+
+    # newlines can lead to strange things happening the new text on the next
+    # line is interpreted as a command to mom.
+    $textblock =~ s/\n/ /g;
     $textblock = $self->_escape( $self->_trim($textblock) );
     $textblock = $self->interpolate( $textblock, $line_num );
     foreach my $method ( $self->mom_methods ) {
-        my $mom_method = "mom_$method";
-        my $ctr        = "$method\_set_in_constructor";
+        my ( $mom, $set_in_contructor )
+          = $self->get_mom_and_ctr_methods($method);
 
         if ( $self->$method ) {
 
             # Don't override these values if set in the contructor
-            if ( not $self->$ctr ) {
+            if ( not $self->$set_in_contructor ) {
+
+                my $orig = "original_$method";
+                $self->$orig($original_textblock);
+
                 # This was set in command()
-                $self->$mom_method($textblock);
+                $self->$mom($textblock);
             }
             return;
         }
@@ -336,78 +430,141 @@ sub add {
 }
 
 {
+
+    sub get_open_close_formats {
+        my ( $self, $pod_seq, $format_code ) = @_;
+        my $parent_format = $self->get_parent_format_code($pod_seq);
+        my $open
+          = $parent_format
+          ? "\\f[P]\\f[${parent_format}$format_code]"
+          : "\\f[$format_code]";
+        my $close
+          = $parent_format
+          ? "\\f[P]\\f[$parent_format]"
+          : "\\f[P]";
+        return ( $open, $close );
+    }
     my %handler_for = (
-        I => sub {    # italics
-            my ( $self, $paragraph ) = @_;
-            return "\\f[I]$paragraph\\f[P]";
+        I => {
+            format_code => 'I',
+            handler     => sub {    # italics
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                my ( $open, $close )
+                  = $self->get_open_close_formats( $pod_seq, 'I' );
+                return "$open$paragraph$close";
+            },
         },
-        C => sub {    # code
-            my ( $self, $paragraph ) = @_;
-            return "\\f[C]$paragraph\\f[P]";
+        C => {
+            format_code => 'C',
+            handler     => sub {    # code
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                my ( $open, $close )
+                  = $self->get_open_close_formats( $pod_seq, 'C' );
+                return "$open$paragraph$close";
+              }
         },
-        B => sub {    # bold
-            my ( $self, $paragraph ) = @_;
-            return "\\f[B]$paragraph\\f[P]";
+        B => {
+            format_code => 'B',
+            handler     => sub {    # bold
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                my ( $open, $close )
+                  = $self->get_open_close_formats( $pod_seq, 'B' );
+                return "$open$paragraph$close";
+              }
         },
-        E => sub {    # entity
-            my ( $self, $paragraph ) = @_;
-            my $num = entity_to_num($paragraph);
-            return "\\N'$num'";
+        E => {
+            format_code => '',
+            handler     => sub {    # entity
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                my $num = entity_to_num($paragraph);
+                return "\\N'$num'";
+              }
         },
-        L => sub {    # link
-            my ( $self, $paragraph ) = @_;
+        L => {
+            format_code => '',
+            handler     => sub {    # link
+                my ( $self, $paragraph, $pod_seq ) = @_;
 
-            # This is legal because the POD docs are quite specific about this.
-            my $strip_quotes = sub { $_[0] =~ s/^"|"$//g };
+           # This is legal because the POD docs are quite specific about this.
+                my $strip_quotes = sub { $_[0] =~ s/^"|"$//g };
 
-            if ( $paragraph !~ m{(?:/|\|)} ) { # no / or |
-                # L<Net::Ping>
-                return "\\f[C]$paragraph\\f[P]";
-            }
-            elsif ( $paragraph =~ m{^([^/]*)\|(.+)$} ) {
-                # L<the Net::Ping module|Net::Ping>
-                # L<support section|PPI/SUPPORT>
-                my ($text, $name) = ( $1, $2 );
+                if ( $paragraph !~ m{(?:/|\|)} ) {    # no / or |
+                                                      # L<Net::Ping>
+                    return "\\f[C]$paragraph\\f[P]";
+                }
+                elsif ( $paragraph =~ m{^([^/]*)\|(.+)$} ) {
 
-                $strip_quotes->($_) foreach $text, $name;
-                if ($name eq $text) {
-                    return "\\f[C]$text\\f[P]";
+                    # L<the Net::Ping module|Net::Ping>
+                    # L<support section|PPI/SUPPORT>
+                    my ( $text, $name ) = ( $1, $2 );
+
+                    $strip_quotes->($_) foreach $text, $name;
+                    if ( $name eq $text ) {
+                        return "\\f[C]$text\\f[P]";
+                    }
+                    else {
+                        return qq{$text (\\f[C]$name\\f[P])};
+                    }
+                }
+                elsif ( $paragraph =~ m{^(.*)/(.*)} ) {
+                    my ( $name, $text ) = ( $1, $2 );
+                    $strip_quotes->($_) foreach $text, $name;
+                    return "$text (\\f[C]$name\\f[P])";
                 }
                 else {
-                    return qq{$text (\\f[C]$name\\f[P])};
+
+                    # XXX eventually we'll need better handling of this
+                    warn "Unknown sequence format for L<$paragraph>";
+                    return qq{"$paragraph"};
                 }
-            }
-            elsif ( $paragraph =~ m{^(.*)/(.*)} ) {
-                my ( $name, $text ) = ( $1, $2 );
-                $strip_quotes->($_) foreach $text, $name;
-                return "$text (\\f[C]$name\\f[P])";
-            }
-            else {
-                # XXX eventually we'll need better handling of this
-                warn "Unknown sequence format for L<$paragraph>";
-                return qq{"$paragraph"};
-            }
+              }
         },
-        F => sub {    # filename
-            my ( $self, $paragraph ) = @_;
-            return "\\f[I]$paragraph\\f[P]";
+        F => {
+            format_code => 'I',
+            handler     => sub {    # filename
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                my ( $open, $close )
+                  = $self->get_open_close_formats( $pod_seq, 'I' );
+                return "$open$paragraph$close";
+              }
         },
-        S => sub {    # non-breaking spaces
-            my ( $self, $paragraph ) = @_;
-            $paragraph =~ s/\s/\\~/g; # non-breaking space
-            return " \\c\n.HYPHENATE OFF\n$paragraph\\c\n.HYPHENATE\n";
+        S => {
+            format_code => '',
+            handler     => sub {    # non-breaking spaces
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                $paragraph =~ s/\s/\\~/g;    # non-breaking space
+                return " \\c\n.HYPHENATE OFF\n$paragraph\\c\n.HYPHENATE\n";
+              }
         },
-        Z => sub {    # null-effect sequence
-            my ( $self, $paragraph ) = @_;
-            return '';
+        Z => {
+            format_code => '',
+            handler     => sub {             # null-effect sequence
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                return '';
+              }
         },
-        X => sub {    # indexes
-            my ( $self, $paragraph ) = @_;
-            return $paragraph;
-            # XXX Rats.  Didn't work.
-            # return "$paragraph\\c\n.IQ $paragraph\\c\n";    # XXX would love to do something here
+        X => {
+            format_code => '',
+            handler     => sub {             # indexes
+                my ( $self, $paragraph, $pod_seq ) = @_;
+                return $paragraph;
+
+                # XXX Rats.  Didn't work. mom doesn't do indexing
+                # return "$paragraph\\c\n.IQ $paragraph\\c\n";
+              }
         },
     );
+
+    sub get_parent_format_code {
+        my ( $self, $pod_seq ) = @_;
+
+        # note that we only handle one level of nesting.  This should change
+        # in the future.
+        return '' unless $pod_seq;
+        my $parent = $pod_seq->nested or return '';
+        no warnings 'uninitialized';
+        return $handler_for{ $parent->name }{format_code} || '';
+    }
 
     sub sequence_handler {
         my ( $self, $sequence ) = @_;
@@ -416,13 +573,14 @@ sub add {
 }
 
 sub interior_sequence {
-    my ( $self, $sequence, $paragraph ) = @_;
+    my ( $self, $sequence, $paragraph, $pod_seq ) = @_;
     if ( my $handler = $self->sequence_handler($sequence) ) {
-        return $self->$handler($paragraph);
+        $handler = $handler->{handler};
+        return $self->$handler( $paragraph, $pod_seq );
     }
     else {
         carp(
-"Unknown sequence ($sequence<$paragraph>).  Stripping sequence code."
+            "Unknown sequence ($sequence<$paragraph>).  Stripping sequence code."
         );
         return $paragraph;
     }
@@ -537,9 +695,9 @@ This is the author of your document.
 This will be the copyright statement on your pod.  Will only appear in the
 document if the C<=head1 COVER> command is given.
 
-=item * COVER
+=item * cover
 
- =for mom COVER
+ =for mom cover
 
 Does not require any text after it.  This is merely a boolean command telling
 C<Pod::Parser::Groffmom> to create a cover page.
@@ -551,9 +709,9 @@ C<Pod::Parser::Groffmom> to create a cover page.
 Does not require any text after it.  This is merely a boolean command telling
 C<Pod::Parser::Groffmom> to create page break here.
 
-=item * TOC
+=item * toc
 
- =for mom TOC
+ =for mom toc
 
 Does not require any text after it.  This is merely a boolean command telling
 C<Pod::Parser::Groffmom> to create a table of contents.  Due to limitations in
@@ -573,7 +731,7 @@ document.
  =end highlight
 
 This turns on syntax highlighting.  Allowable highlight types are the types
-allowed for C<Syntax::Highlight::Engine::Kate>.  We default to Perl, so the
+allowed for L<Syntax::Highlight::Engine::Kate>.  We default to Perl, so the
 above can be written as:
 
  =begin highlight 
@@ -587,7 +745,62 @@ above can be written as:
  =end highlight
 
 For a list of allowable names for syntax highlighting, see
-C<Pod::Parser::Groffmom::Color>.
+L<Pod::Parser::Groffmom::Color>.
+
+=item * C<for mom tofile $filename>
+
+This command tells L<Pod::Parser::Groffmom> that you're going to send some
+output to a file.  Must have a filename with it.
+
+=item * C<begin mom tofile>
+
+Sometimes you want to include data in your pod and have it written out to a
+separate file.  This is useful, for example, if you're writing the POD for
+beautiful documentation for a talk, but you want to embed slides for your
+talk.
+
+ =begin mom tofile
+
+ <h1>Some Header</h1>
+ <h2>Another header</h2>
+
+ =end mom tofile
+
+Any paragraph or verbatim text included between these tokens are automatically
+sent to the C<$filename> specified in C<=for mom tofile $filename>.  The file
+is opened in I<append> mode, so any text found will be added to what is
+already there.  The text is passed "as is".
+
+If you must pass pod, the leading '=' sign will cause this text to be handled
+by L<Pod::Parser::Groffmom> instead of being passed to your file.  Thus, any
+leading '=' must be escaped in the format you need it in:
+
+ =for mom tofile tmp/some.html
+
+ ... perhaps lots of pod ...
+
+ =begin mom tofile
+
+ <p>To specify a header in POD:</p>
+
+ <pre><tt>
+ &#61;head1 SOME HEADER
+ </tt></pre>
+
+ =end mom tofile
+
+Of course, if the line is indented, it's considered "verbatim" text and will
+be not be processed as a POD command:
+
+ =begin mom tofile
+
+ <p>To specify a header in POD:</p>
+
+ <pre><tt>
+  =head1 SOME HEADER
+ </tt></pre>
+
+ =end mom tofile
 
 =back
 
@@ -604,6 +817,8 @@ written as:
 
  Salvador FandiE<241>o
 
+And should be rendered as "Salvador FandiE<241>o".
+
 =head1 LIMITATIONS
 
 Probably plenty.
@@ -616,13 +831,16 @@ Probably plenty.
 
 =item * Syntax highlighting is experimental.
 
-=item * No support for hyperlinks.  C<< L<> >> is rendered with quotes.
+=item * No support for hyperlinks.
 
 =item * No C<=head4> or below are supported.
 
 =item * Table of contents are generated at the end. This is a limitation of mom.
 
-=item * C<=for...> not handled.
+The L<bin/pod2mom> script in this distribution will attempt to correct that
+for you.
+
+=item * C<=for> is ignored except for C<=for mom tofile $filename>.
 
 =item * C<SE<lt>E<gt>> sequences try to work but they're finicky.
 

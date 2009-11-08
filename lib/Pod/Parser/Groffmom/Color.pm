@@ -6,11 +6,11 @@ Pod::Parser::Groffmom - Color formatting for groff -mom.
 
 =head1 VERSION
 
-Version 0.030
+Version 0.040
 
 =cut
 
-our $VERSION = '0.030';
+our $VERSION = '0.040';
 $VERSION = eval $VERSION;
 
 use warnings;
